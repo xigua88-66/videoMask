@@ -1,0 +1,3 @@
+([('VideoMask',
+   '/Users/daxigua/Desktop/精英科技/src/python/videoMask/dist/VideoMask',
+   'EXECUTABLE')],)
