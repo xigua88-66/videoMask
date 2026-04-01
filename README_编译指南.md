@@ -25,7 +25,7 @@
 
 ```bash
 # 1. 激活虚拟环境
-source env/bin/activate
+source venv/bin/activate
 
 # 2. 安装PyInstaller（如果还没安装）
 pip install pyinstaller
@@ -53,8 +53,8 @@ env\Scripts\activate
 # 2. 安装PyInstaller
 pip install pyinstaller
 
-# 3. 编译为独立可执行文件
-pyinstaller videoMask.spec --noconfirm
+# 3. 编译为独立可执行文件（Windows 专用 spec）
+pyinstaller videoMask_windows.spec --noconfirm
 
 # 4. 编译后的应用位置
 # dist\videoMask.exe (Windows可执行文件)
@@ -67,7 +67,11 @@ pyinstaller videoMask.spec --noconfirm
 
 ### 📦 PyInstaller配置说明
 
-当前 `videoMask.spec` 配置：
+当前推荐使用双 spec：
+- `videoMask.spec`：macOS 打包
+- `videoMask_windows.spec`：Windows 打包
+
+示例（macOS）：
 ```python
 # -*- mode: python ; coding: utf-8 -*-
 
@@ -120,6 +124,7 @@ if sys.platform == 'darwin':
 - ✅ **Python运行时** - 无需安装Python
 - ✅ **PyQt6** - GUI框架
 - ✅ **OpenCV** - 视频和图像处理
+- ✅ **Pillow** - 中文标签渲染（防止视频合成文字乱码）
 - ✅ **所有标准库** - json, os, sys等
 - ✅ **应用代码** - 完整的功能实现
 
@@ -134,7 +139,7 @@ if sys.platform == 'darwin':
 ### 🖥️ 开发环境（源码运行）
 ```bash
 # 日志直接输出到终端
-source env/bin/activate
+source venv/bin/activate
 python app/main.py
 ```
 
