@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local virtual environment
+venv/
+
+# Local runtime artifacts
+data/
+*_annotated.mp4
+
+# macOS noise
+.DS_Store
