@@ -1,3 +1,6 @@
-PyQt6
-opencv-python
-PyInstaller
+PyQt6==6.8.1
+PyQt6-Qt6==6.8.2
+PyQt6-sip==13.11.1
+opencv-python==4.13.0.92
+Pillow
+PyInstaller==6.19.0

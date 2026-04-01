@@ -3,17 +3,63 @@ import os
 import json
 import shutil
 import logging
+import builtins
+import importlib.util
 from pathlib import Path
 from datetime import datetime
+
+
+def _ensure_qt_platform_plugin_env():
+    """
+    修复部分环境下 Qt 插件路径为空，导致找不到 cocoa 平台插件的问题。
+    仅在路径缺失或无效时设置，不覆盖用户的正确配置。
+    """
+    current = os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH", "").strip()
+    if current and (Path(current) / "libqcocoa.dylib").exists():
+        return
+
+    candidates = []
+
+    # 常见 venv 路径
+    py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates.append(Path(sys.prefix) / "lib" / py_ver / "site-packages" / "PyQt6" / "Qt6" / "plugins" / "platforms")
+
+    # 基于模块定位路径（不导入 PyQt6）
+    spec = importlib.util.find_spec("PyQt6")
+    if spec and spec.submodule_search_locations:
+        pyqt_root = Path(list(spec.submodule_search_locations)[0])
+        candidates.append(pyqt_root / "Qt6" / "plugins" / "platforms")
+
+    for candidate in candidates:
+        if (candidate / "libqcocoa.dylib").exists():
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(candidate)
+            return
+
+
+_ensure_qt_platform_plugin_env()
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QWidget, 
                              QVBoxLayout, QHBoxLayout, QListWidget, QFileDialog, QDialog, 
                              QFormLayout, QLineEdit, QSpinBox, QDialogButtonBox, 
                              QLabel, QStackedWidget, QColorDialog, QToolBar, QSlider, QSizePolicy,
                              QInputDialog, QListWidgetItem, QMessageBox)
 from PyQt6.QtCore import Qt, QPoint, QPointF
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QAction, QColor, QPaintEvent, QFont, QFontMetrics
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QAction, QColor, QPaintEvent, QFont, QFontMetrics, QShortcut, QKeySequence
 
-from core.video_processor import extract_frames, create_video
+from core.video_processor import extract_frames, create_video, probe_video
+
+# 运行模式：默认关闭调试输出；设置 VIDEOMASK_DEBUG=1 开启
+DEBUG_MODE = os.environ.get("VIDEOMASK_DEBUG", "0") == "1"
+
+# 统一控制本文件中的 print 输出，发布版默认抑制调试噪音
+_raw_print = builtins.print
+def print(*args, **kwargs):  # noqa: A001
+    if DEBUG_MODE:
+        _raw_print(*args, **kwargs)
+        return
+    text = " ".join(str(a) for a in args)
+    if "[DEBUG]" in text or "[TIP]" in text:
+        return
+    _raw_print(*args, **kwargs)
 
 # 配置日志输出到文件
 # 创建日志目录
@@ -26,7 +72,7 @@ log_file = log_dir / f"videoMask_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 # 配置日志
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
     format=log_format,
     handlers=[
         logging.FileHandler(log_file, encoding='utf-8'),
@@ -36,6 +82,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 logger.info(f"🚀 视频标注工具启动 - 日志文件: {log_file}")
+logger.info(f"🧭 调试模式: {'开启' if DEBUG_MODE else '关闭'} (VIDEOMASK_DEBUG)")
 
 class NewTaskDialog(QDialog):
     def __init__(self, parent=None):
@@ -103,6 +150,7 @@ class AnnotationLabel(QLabel):
         self.current_thickness = 2
         self.current_font_size = 16
         self.current_bold_state = False
+        self.default_text = ""
         
         # 用于移动和编辑
         self.selected_shape = None
@@ -229,6 +277,69 @@ class AnnotationLabel(QLabel):
             # 否则设置当前工具的粗体状态
             self.current_bold_state = bold
 
+    def set_default_text(self, text):
+        """设置文本标注默认内容，避免重复输入。"""
+        self.default_text = text or ""
+
+    def get_shape_label_text(self, shape):
+        """获取图形关联文本（用于矩形/多边形旁注）。"""
+        return (shape.get("label_text") or "").strip()
+
+    def get_shape_label_anchor(self, shape):
+        """基于图形几何信息计算文字锚点（图片坐标）。"""
+        if shape["type"] == "rectangle":
+            p1, p2 = shape["points"]
+            return QPointF(min(p1.x(), p2.x()), min(p1.y(), p2.y()) - 8)
+        if shape["type"] == "polygon" and shape["points"]:
+            min_x = min(p.x() for p in shape["points"])
+            min_y = min(p.y() for p in shape["points"])
+            return QPointF(min_x, min_y - 8)
+        return None
+
+    def draw_shape_label(self, painter, shape, use_screen_coords=True):
+        """绘制图形旁注文本。"""
+        label_text = self.get_shape_label_text(shape)
+        if not label_text:
+            return
+        anchor = self.get_shape_label_anchor(shape)
+        if anchor is None:
+            return
+        draw_pos = self.pixmap_to_screen_pos(anchor) if use_screen_coords else anchor
+        font = QFont()
+        font.setPointSize(shape.get("label_font_size", 14))
+        font.setBold(shape.get("label_bold", False))
+        painter.setFont(font)
+        painter.setPen(QPen(shape.get("color", self.current_color), 1, Qt.PenStyle.SolidLine))
+        painter.drawText(draw_pos.toPoint(), label_text)
+
+    def resolve_label_text(self):
+        """使用当前已选类别标签，不再弹窗输入。"""
+        text = self.default_text.strip()
+        if not text:
+            return None
+        return text
+
+    def finalize_polygon(self):
+        """完成多边形标注（右键结束）。"""
+        if len(self.current_polygon_points) < 3:
+            return False
+        label_text = self.resolve_label_text()
+        if not label_text:
+            return False
+        shape_info = {
+            "type": "polygon",
+            "points": tuple(self.current_polygon_points),
+            "color": self.current_color,
+            "thickness": self.current_thickness,
+            "label_text": label_text,
+            "label_font_size": self.current_font_size,
+            "label_bold": self.current_bold_state,
+        }
+        self.shapes.append(shape_info)
+        self.current_polygon_points = []
+        self.update()
+        return True
+
     def set_shape_type(self, shape_type):
         self.current_shape_type = shape_type
         self.current_polygon_points = [] # 切换工具时重置当前多边形
@@ -305,6 +416,14 @@ class AnnotationLabel(QLabel):
         return inside
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            if self.current_shape_type == 'polygon':
+                if self.finalize_polygon():
+                    print("🔺 [DEBUG] Polygon completed by right click")
+                else:
+                    print("⚠️ [DEBUG] Polygon needs >=3 points and non-empty label")
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
             import time
             current_time = time.time()
@@ -376,19 +495,6 @@ class AnnotationLabel(QLabel):
             elif self.current_shape_type == 'polygon':
                 self.current_polygon_points.append(pixmap_pos)
                 self.update() # 更新显示，画出点和线段
-            elif self.current_shape_type == 'text':
-                text, ok = QInputDialog.getText(self, '输入文字', '请输入要标注的文字:')
-                if ok and text:
-                    shape_info = {
-                        "type": "text",
-                        "text": text,
-                        "pos": pixmap_pos,
-                        "color": self.current_color,
-                        "font_size": self.current_font_size,
-                        "bold": self.current_bold_state
-                    }
-                    self.shapes.append(shape_info)
-                    self.update()
 
     def mouseMoveEvent(self, event):
         pixmap_pos = self.screen_to_pixmap_pos(event.pos())
@@ -420,16 +526,21 @@ class AnnotationLabel(QLabel):
             
             if self.dragging:
                 self.dragging = False
-                self.selected_shape = None
                 self.update()
 
             elif self.drawing and self.current_shape_type == 'rectangle':
                 self.drawing = False
+                label_text = self.resolve_label_text()
+                if not label_text:
+                    return
                 shape_info = {
                     "type": "rectangle",
                     "points": (self.start_point, self.end_point),
                     "color": self.current_color,
-                    "thickness": self.current_thickness
+                    "thickness": self.current_thickness,
+                    "label_text": label_text,
+                    "label_font_size": self.current_font_size,
+                    "label_bold": self.current_bold_state,
                 }
                 self.shapes.append(shape_info)
                 self.update()
@@ -444,18 +555,6 @@ class AnnotationLabel(QLabel):
                 print(f"🚫 [DEBUG] Exiting edit mode, selection cleared")
                 self.selected_shape = None
                 self.update()
-            elif self.current_shape_type == 'polygon' and len(self.current_polygon_points) > 2:
-                # 完成多边形绘制
-                shape_info = {
-                    "type": "polygon",
-                    "points": tuple(self.current_polygon_points), # 改为tuple保持一致性
-                    "color": self.current_color,
-                    "thickness": self.current_thickness
-                }
-                self.shapes.append(shape_info)
-                print(f"🔺 [DEBUG] Polygon completed with {len(self.current_polygon_points)} points")
-                self.current_polygon_points = []
-                self.update()
         elif event.key() == Qt.Key.Key_Escape:
             # Esc键退出编辑模式或取消选择
             if self.editing_mode:
@@ -465,6 +564,14 @@ class AnnotationLabel(QLabel):
                 self.selected_shape = None
                 print(f"🚫 [DEBUG] Selection cleared")
             self.update()
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            # 传统标注软件行为：Delete 删除当前选中框
+            if self.selected_shape and self.selected_shape in self.shapes:
+                self.shapes.remove(self.selected_shape)
+                self.selected_shape = None
+                self.editing_mode = False
+                print("🗑️ [DEBUG] Selected annotation deleted")
+                self.update()
         super().keyPressEvent(event)
 
 
@@ -489,9 +596,11 @@ class AnnotationLabel(QLabel):
                     p2_screen = self.pixmap_to_screen_pos(shape["points"][1])
                     rect = self.get_rect_from_points(p1_screen, p2_screen)
                     painter.drawRect(*rect)
+                    self.draw_shape_label(painter, shape, use_screen_coords=True)
                 elif shape["type"] == "polygon":
                     screen_points = [self.pixmap_to_screen_pos(p) for p in shape["points"]]
                     painter.drawPolygon(screen_points)
+                    self.draw_shape_label(painter, shape, use_screen_coords=True)
                 elif shape["type"] == "text":
                     font = QFont()
                     font.setPointSize(shape["font_size"])
@@ -559,6 +668,18 @@ class AnnotationLabel(QLabel):
             p2_screen = self.pixmap_to_screen_pos(self.end_point)
             rect = self.get_rect_from_points(p1_screen, p2_screen)
             painter.drawRect(*rect)
+            # 实时预览：画框过程中同步显示文本内容
+            preview_text = self.default_text.strip()
+            if preview_text:
+                preview_shape = {
+                    "type": "rectangle",
+                    "points": (self.start_point, self.end_point),
+                    "label_text": preview_text,
+                    "label_font_size": self.current_font_size,
+                    "label_bold": self.current_bold_state,
+                    "color": self.current_color,
+                }
+                self.draw_shape_label(painter, preview_shape, use_screen_coords=True)
         
         # 绘制正在画的多边形 (屏幕坐标)
         if self.current_shape_type == 'polygon' and self.current_polygon_points:
@@ -568,6 +689,18 @@ class AnnotationLabel(QLabel):
             painter.drawPoints(screen_points)
             if len(self.current_polygon_points) > 1:
                 painter.drawPolyline(screen_points)
+            # 实时预览：多边形打点过程中同步显示文本内容
+            preview_text = self.default_text.strip()
+            if preview_text:
+                preview_shape = {
+                    "type": "polygon",
+                    "points": tuple(self.current_polygon_points),
+                    "label_text": preview_text,
+                    "label_font_size": self.current_font_size,
+                    "label_bold": self.current_bold_state,
+                    "color": self.current_color,
+                }
+                self.draw_shape_label(painter, preview_shape, use_screen_coords=True)
         
         if not painter_override:
             painter.end()
@@ -586,6 +719,7 @@ class AnnotationWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.layout = QVBoxLayout(self)
+        self._last_saved_signature = None
         
         # 工具栏
         self.toolbar = QToolBar()
@@ -602,10 +736,18 @@ class AnnotationWidget(QWidget):
         self.poly_action.triggered.connect(lambda: self.set_shape_type('polygon'))
         self.toolbar.addAction(self.poly_action)
 
-        self.text_action = QAction("文本", self)
-        self.text_action.setCheckable(True)
-        self.text_action.triggered.connect(lambda: self.set_shape_type('text'))
-        self.toolbar.addAction(self.text_action)
+        self.toolbar.addSeparator()
+        self.text_input_label = QLabel("标签:")
+        self.toolbar.addWidget(self.text_input_label)
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText("输入类别/标签，画框时自动附加")
+        self.text_input.setMinimumWidth(220)
+        self.toolbar.addWidget(self.text_input)
+
+        self.toolbar.addSeparator()
+        self.category_hint_label = QLabel("快捷键: 1~9 切类")
+        self.category_hint_label.setStyleSheet("color: #666;")
+        self.toolbar.addWidget(self.category_hint_label)
 
 
         self.toolbar.addSeparator()
@@ -656,8 +798,8 @@ class AnnotationWidget(QWidget):
 
         self.toolbar.addSeparator()
 
-        self.save_action = QAction("保存", self)
-        self.save_action.triggered.connect(self.save_annotations)
+        self.save_action = QAction("保存并下一张", self)
+        self.save_action.triggered.connect(self.manual_save_annotations)
         self.toolbar.addAction(self.save_action)
         
         self.preview_action = QAction("🔍 预览效果", self)
@@ -667,16 +809,40 @@ class AnnotationWidget(QWidget):
         self.image_label = AnnotationLabel() # 使用我们自定义的Label
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setStyleSheet("border: 1px solid black;")
+        self.text_input.textChanged.connect(self.image_label.set_default_text)
+
+        # 左侧类别列表
+        self.category_panel = QWidget()
+        category_layout = QVBoxLayout(self.category_panel)
+        category_layout.setContentsMargins(0, 0, 6, 0)
+        category_layout.addWidget(QLabel("类别列表"))
+        self.category_list = QListWidget()
+        self.category_list.setMinimumWidth(180)
+        self.category_list.setMaximumWidth(260)
+        self.category_list.setAlternatingRowColors(True)
+        category_layout.addWidget(self.category_list, 1)
+
+        for i in range(1, 10):
+            item = QListWidgetItem(f"{i}. 类别{i}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self.category_list.addItem(item)
+        self.category_list.setCurrentRow(0)
+        self.category_list.currentItemChanged.connect(self._on_category_changed)
 
         # 底部导航和返回按钮
         navigation_layout = QHBoxLayout()
         self.prev_button = QPushButton("<< 上一张")
+        self.next_unannotated_button = QPushButton("下一张未标注")
         self.delete_current_button = QPushButton("🗑️ 删除当前图片")
         self.back_button = QPushButton("返回列表")
         self.next_button = QPushButton("下一张 >>")
+        self.progress_label = QLabel("图片 0/0")
+        self.progress_label.setStyleSheet("color: #666;")
         
         # 确保按钮可以接收焦点和事件
         self.prev_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.next_unannotated_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.delete_current_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.back_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.next_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -685,14 +851,44 @@ class AnnotationWidget(QWidget):
         self.delete_current_button.setStyleSheet("QPushButton { background-color: #ffebee; color: #c62828; border: 1px solid #c62828; }")
         
         navigation_layout.addWidget(self.prev_button)
+        navigation_layout.addWidget(self.next_unannotated_button)
         navigation_layout.addWidget(self.delete_current_button)
         navigation_layout.addStretch()
+        navigation_layout.addWidget(self.progress_label)
         navigation_layout.addWidget(self.back_button)
         navigation_layout.addStretch()
         navigation_layout.addWidget(self.next_button)
 
         self.layout.addLayout(navigation_layout)
-        self.layout.addWidget(self.image_label, 1)
+        content_layout = QHBoxLayout()
+        content_layout.addWidget(self.category_panel)
+        content_layout.addWidget(self.image_label, 1)
+        self.layout.addLayout(content_layout, 1)
+
+        # 导航快捷键：A/左箭头 上一张，D/右箭头 下一张
+        self.prev_shortcut_a = QShortcut(QKeySequence("A"), self)
+        self.prev_shortcut_left = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        self.next_shortcut_d = QShortcut(QKeySequence("D"), self)
+        self.next_shortcut_right = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        self.next_unannotated_shortcut = QShortcut(QKeySequence("W"), self)
+        self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.save_and_next_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.category_shortcuts = []
+        for i in range(1, 10):
+            sc = QShortcut(QKeySequence(str(i)), self)
+            sc.activated.connect(lambda idx=i: self._select_category_by_index(idx))
+            self.category_shortcuts.append(sc)
+        self.prev_shortcut_a.activated.connect(self._trigger_prev_shortcut)
+        self.prev_shortcut_left.activated.connect(self._trigger_prev_shortcut)
+        self.next_shortcut_d.activated.connect(self._trigger_next_shortcut)
+        self.next_shortcut_right.activated.connect(self._trigger_next_shortcut)
+        self.next_unannotated_shortcut.activated.connect(self._trigger_next_unannotated_shortcut)
+        self.save_shortcut.activated.connect(self._trigger_save_shortcut)
+        self.save_and_next_shortcut.activated.connect(self._trigger_save_and_next_shortcut)
+        self.undo_shortcut.activated.connect(self._trigger_undo_shortcut)
+        self.text_input.returnPressed.connect(self._focus_canvas_for_fast_labeling)
+        self._on_category_changed(self.category_list.currentItem(), None)
     
     def delete_current_image(self):
         """删除当前正在标注的图片"""
@@ -731,6 +927,9 @@ class AnnotationWidget(QWidget):
                     print(f"🗑️ [DEBUG] Deleted annotation data: {json_path}")
                 
                 print(f"✅ [DEBUG] Image '{image_name}' deleted successfully from annotation view")
+                main_window = self.window()
+                if isinstance(main_window, MainWindow):
+                    main_window._update_annotation_summary()
                 
                 # 通知主窗口切换到下一张图片
                 # 通过QApplication获取主窗口实例
@@ -744,11 +943,71 @@ class AnnotationWidget(QWidget):
                 print(f"❌ [ERROR] Failed to delete image '{image_name}': {e}")
                 QMessageBox.critical(self, "删除失败", f"删除图片时发生错误：{e}")
 
+    def _trigger_prev_shortcut(self):
+        # 文本输入框有焦点时，不抢快捷键，避免影响输入体验
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return
+        self.prev_button.click()
+
+    def _trigger_next_shortcut(self):
+        # 文本输入框有焦点时，不抢快捷键，避免影响输入体验
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return
+        self.next_button.click()
+
+    def _trigger_next_unannotated_shortcut(self):
+        # 文本输入框有焦点时，不抢快捷键，避免影响输入体验
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return
+        self.next_unannotated_button.click()
+
+    def _trigger_save_shortcut(self):
+        self.manual_save_annotations()
+
+    def _trigger_save_and_next_shortcut(self):
+        """Ctrl+Enter：保存后直接切到下一张。"""
+        self.manual_save_annotations()
+
+    def _trigger_undo_shortcut(self):
+        # 文本输入框聚焦时，优先保留输入框自身 Ctrl+Z 行为
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return
+        self.undo_last_annotation()
+        self._show_status_message("已撤销上一步标注（Ctrl+Z）")
+
+    def _focus_canvas_for_fast_labeling(self):
+        """标签输入框回车后聚焦画布，直接继续画框。"""
+        self.set_shape_type('rectangle')
+        self.image_label.setFocus()
+        self._show_status_message("标签已就绪，拖拽画框即可完成标注")
+
+    def _show_status_message(self, message, timeout=2000):
+        main_window = self.window()
+        if isinstance(main_window, QMainWindow):
+            main_window.statusBar().showMessage(message, timeout)
+
+    def _on_category_changed(self, current, previous):
+        if not current:
+            return
+        raw_text = current.text()
+        label_text = raw_text.split(". ", 1)[1] if ". " in raw_text else raw_text
+        self.text_input.setText(label_text.strip())
+        self.image_label.set_default_text(label_text.strip())
+        idx = current.data(Qt.ItemDataRole.UserRole)
+        self._show_status_message(f"已切换类别 {idx}: {label_text.strip()}", 1200)
+
+    def _select_category_by_index(self, idx):
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return
+        row = idx - 1
+        if row < 0 or row >= self.category_list.count():
+            return
+        self.category_list.setCurrentRow(row)
+
     def set_shape_type(self, shape_type):
         self.image_label.set_shape_type(shape_type)
         self.rect_action.setChecked(shape_type == 'rectangle')
         self.poly_action.setChecked(shape_type == 'polygon')
-        self.text_action.setChecked(shape_type == 'text')
 
     def select_color(self):
         color = QColorDialog.getColor()
@@ -776,6 +1035,18 @@ class AnnotationWidget(QWidget):
 
     def undo_last_annotation(self):
         self.image_label.undo()
+
+    def manual_save_annotations(self):
+        self.save_annotations()
+        self._show_status_message("已保存，正在进入下一张")
+        main_window = self.window()
+        if isinstance(main_window, MainWindow):
+            main_window._update_navigation_buttons()
+            main_window._update_annotation_summary()
+            main_window.show_next_image()
+
+    def set_progress_text(self, text):
+        self.progress_label.setText(text)
 
     def set_image(self, original_path, annotated_path):
         print(f"🚀 [DEBUG] set_image called")
@@ -807,13 +1078,28 @@ class AnnotationWidget(QWidget):
         # 加载现有标注数据到内存中供编辑
         self.image_label.shapes = self.load_annotation_data()
         print(f"📊 [DEBUG] Loaded {len(self.image_label.shapes)} annotations from JSON for editing")
+        self._last_saved_signature = self._build_annotation_signature()
+
+        # 切图时保持当前选中类别，不再被当前图片历史标注覆盖
+        current_item = self.category_list.currentItem()
+        if current_item:
+            raw_text = current_item.text()
+            label_text = raw_text.split(". ", 1)[1] if ". " in raw_text else raw_text
+            self.text_input.setText(label_text.strip())
+            self.image_label.set_default_text(label_text.strip())
         
         # 将原始pixmap传递给label，由label自己管理缩放
         print(f"📤 [DEBUG] Calling image_label.set_new_pixmap")
         self.image_label.set_new_pixmap(pixmap)
         print(f"📤 [DEBUG] set_new_pixmap call completed")
         
-    def save_annotations(self):
+    def save_annotations(self, only_if_changed=False, refresh_task_list=True):
+        if only_if_changed:
+            current_signature = self._build_annotation_signature()
+            if self._last_saved_signature == current_signature:
+                print("💾 [DEBUG] Auto-save skipped: annotations unchanged")
+                return False
+
         # 1. 保存标注元数据到 JSON 文件 (现在存的是真实坐标)
         self.save_annotation_data()
 
@@ -830,8 +1116,10 @@ class AnnotationWidget(QWidget):
             if shape["type"] == "rectangle":
                 rect = self.image_label.get_rect_from_points(shape["points"][0], shape["points"][1])
                 painter.drawRect(*rect)
+                self.image_label.draw_shape_label(painter, shape, use_screen_coords=False)
             elif shape["type"] == "polygon":
                 painter.drawPolygon(shape["points"])
+                self.image_label.draw_shape_label(painter, shape, use_screen_coords=False)
             elif shape["type"] == "text":
                 font = QFont()
                 font.setPointSize(shape["font_size"])
@@ -845,12 +1133,25 @@ class AnnotationWidget(QWidget):
         # 保持标注页面始终显示JSON数据（可编辑状态）
         # 不改变当前显示，用户可以继续编辑
         print(f"🎨 [DEBUG] 保持编辑模式，用户可以继续标注或通过预览按钮查看效果")
+        self._last_saved_signature = self._build_annotation_signature()
         
         print(f"标注已保存到 {self.annotated_image_path}")
         
         # 刷新任务列表中的标注状态显示
-        if hasattr(self.parent(), 'current_task_widget') and self.parent().current_task_widget:
+        if refresh_task_list and hasattr(self.parent(), 'current_task_widget') and self.parent().current_task_widget:
+            current_image_name = os.path.basename(self.original_image_path) if hasattr(self, "original_image_path") else None
             self.parent().current_task_widget.load_images()
+            if current_image_name:
+                list_widget = self.parent().current_task_widget.image_list_widget
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    if (item.data(Qt.ItemDataRole.UserRole) or item.text()) == current_image_name:
+                        list_widget.setCurrentItem(item)
+                        break
+        main_window = self.window()
+        if isinstance(main_window, MainWindow):
+            main_window._update_annotation_summary()
+        return True
             
     def preview_annotated_image(self):
         """预览标注后的图片效果"""
@@ -923,33 +1224,39 @@ class AnnotationWidget(QWidget):
         # 重置后不再是已保存标注状态
         self.image_label.is_displaying_saved_annotations = False
         self.image_label.set_new_pixmap(pixmap)
+        self._last_saved_signature = self._build_annotation_signature()
         print("标注已重置。")
         
         # 刷新任务列表中的标注状态显示
         if hasattr(self.parent(), 'current_task_widget') and self.parent().current_task_widget:
             self.parent().current_task_widget.load_images()
+        main_window = self.window()
+        if isinstance(main_window, MainWindow):
+            main_window._update_annotation_summary()
 
     def get_json_path(self):
         return os.path.splitext(self.annotated_image_path)[0] + ".json"
 
-    def save_annotation_data(self):
-        json_path = self.get_json_path()
-        # 需要将 PyQt 对象（如 QPoint, QColor）转换为可序列化的格式
+    def _serialize_shapes(self):
         serializable_shapes = []
         for shape in self.image_label.shapes:
             s_shape = shape.copy()
-            
-            # 修复 KeyError: 'points'
-            if s_shape.get("points"): # Handles both rectangle and polygon
+            if s_shape.get("points"):  # Handles both rectangle and polygon
                 s_shape["points"] = [(p.x(), p.y()) for p in s_shape["points"]]
-            
-            if s_shape.get("pos"): # Handles text
+            if s_shape.get("pos"):  # Handles text
                 s_shape["pos"] = (s_shape["pos"].x(), s_shape["pos"].y())
-
-            # 修复：只在颜色是QColor对象时才调用 .name()
             if isinstance(s_shape.get("color"), QColor):
                 s_shape["color"] = s_shape["color"].name()
             serializable_shapes.append(s_shape)
+        return serializable_shapes
+
+    def _build_annotation_signature(self):
+        serializable_shapes = self._serialize_shapes()
+        return json.dumps(serializable_shapes, sort_keys=True, ensure_ascii=False)
+
+    def save_annotation_data(self):
+        json_path = self.get_json_path()
+        serializable_shapes = self._serialize_shapes()
 
         with open(json_path, 'w') as f:
             json.dump(serializable_shapes, f, indent=4)
@@ -1155,6 +1462,7 @@ class MainWindow(QMainWindow):
         self.annotation_widget = AnnotationWidget()
         self.annotation_widget.back_button.clicked.connect(lambda: self.debug_button_click("back", self.show_task_view))
         self.annotation_widget.prev_button.clicked.connect(lambda: self.debug_button_click("prev", self.show_previous_image))
+        self.annotation_widget.next_unannotated_button.clicked.connect(lambda: self.debug_button_click("next_unannotated", self.show_next_unannotated_image))
         self.annotation_widget.delete_current_button.clicked.connect(self.annotation_widget.delete_current_image)
         self.annotation_widget.next_button.clicked.connect(lambda: self.debug_button_click("next", self.show_next_image))
 
@@ -1163,7 +1471,10 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.annotation_widget)
 
         self.current_task_name = None
+        self.status_summary_label = QLabel("待开始")
+        self.statusBar().addPermanentWidget(self.status_summary_label)
         self.load_tasks()
+        self._update_annotation_summary()
 
     def debug_button_click(self, button_name, callback):
         print(f"🔘 [DEBUG] Button '{button_name}' clicked!")
@@ -1175,6 +1486,19 @@ class MainWindow(QMainWindow):
 
     def get_tasks_file(self):
         return os.path.join("data", "tasks.json")
+
+    def get_task_meta_file(self, task_name):
+        return os.path.join("data", task_name, "task_meta.json")
+
+    def load_task_meta(self, task_name):
+        meta_file = self.get_task_meta_file(task_name)
+        if not os.path.exists(meta_file):
+            return {}
+        try:
+            with open(meta_file, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
     def load_tasks(self):
         self.task_list_widget.clear()
@@ -1240,6 +1564,16 @@ class MainWindow(QMainWindow):
             os.makedirs(original_frames_dir, exist_ok=True)
             os.makedirs(annotated_frames_dir, exist_ok=True)
 
+            video_info = probe_video(video_path) or {}
+            task_meta = {
+                "video_path": video_path,
+                "frame_interval": frame_interval,
+                "source_fps": video_info.get("fps", 0),
+                "source_total_frames": video_info.get("total_frames", 0),
+            }
+            with open(self.get_task_meta_file(self.current_task_name), 'w') as f:
+                json.dump(task_meta, f, indent=4)
+
             print(f"开始抽帧，请稍候...")
             extract_frames(video_path, original_frames_dir, frame_interval)
             print("抽帧完成。")
@@ -1263,6 +1597,7 @@ class MainWindow(QMainWindow):
         self.current_task_widget = TaskWidget(self.current_task_name, self)
         self.stacked_widget.insertWidget(1, self.current_task_widget)
         self.stacked_widget.setCurrentIndex(1)
+        self._update_annotation_summary()
 
     def open_annotation_view(self, item):
         # 从 UserRole 获取原始文件名，忽略标注状态标记
@@ -1308,26 +1643,57 @@ class MainWindow(QMainWindow):
             # 强制更新以确保显示
             self.stacked_widget.update()
             self.annotation_widget.update()
+            self._update_navigation_buttons()
 
     def show_previous_image(self):
         if not self.current_task_widget:
             return
-        
+        self._autosave_current_annotations()
         list_widget = self.current_task_widget.image_list_widget
         current_row = list_widget.currentRow()
         if current_row > 0:
             item = list_widget.item(current_row - 1)
             self.open_annotation_view(item)
+        else:
+            self.statusBar().showMessage("已经是第一张图片", 1500)
+            self._update_navigation_buttons()
 
     def show_next_image(self):
         if not self.current_task_widget:
             return
-        
+        self._autosave_current_annotations()
         list_widget = self.current_task_widget.image_list_widget
         current_row = list_widget.currentRow()
         if current_row < list_widget.count() - 1:
             item = list_widget.item(current_row + 1)
             self.open_annotation_view(item)
+        else:
+            self.statusBar().showMessage("已经是最后一张图片", 1500)
+            self._update_navigation_buttons()
+
+    def show_next_unannotated_image(self):
+        if not self.current_task_widget:
+            return
+        self._autosave_current_annotations()
+        list_widget = self.current_task_widget.image_list_widget
+        total = list_widget.count()
+        if total == 0:
+            return
+
+        current_row = list_widget.currentRow()
+        start_row = 0 if current_row < 0 else current_row
+
+        # 从当前下一张开始找，找不到再从头回绕到当前
+        for offset in range(1, total + 1):
+            row = (start_row + offset) % total
+            item = list_widget.item(row)
+            if item and item.text().startswith("⚪ "):
+                self.open_annotation_view(item)
+                self.statusBar().showMessage("已跳转到下一张未标注图片", 1500)
+                return
+
+        self.statusBar().showMessage("当前任务已全部标注完成", 2000)
+        self._update_navigation_buttons()
     
     def switch_to_next_after_delete(self):
         """删除当前图片后，智能切换到下一张图片"""
@@ -1390,10 +1756,21 @@ class MainWindow(QMainWindow):
             save_path, _ = QFileDialog.getSaveFileName(self, "保存视频", f"{self.current_task_name}_annotated.mp4", "MP4视频 (*.mp4)")
             
             if save_path:
-                # 这里可以再弹出一个对话框来获取FPS，为简化，我们先用一个默认值
-                fps = 30 
+                meta = self.load_task_meta(self.current_task_name)
+                original_video_path = meta.get("video_path")
+                frame_interval = int(meta.get("frame_interval", 1) or 1)
+                source_fps = float(meta.get("source_fps", 0) or 0)
+                fps = source_fps if source_fps > 0 else 30
+                if not original_video_path or not os.path.exists(original_video_path):
+                    print("⚠️ [WARN] 未找到原始视频路径，将按抽帧图片序列直接合成。")
                 print(f"开始合成视频，请稍候...")
-                create_video(annotated_frames_dir, save_path, fps)
+                create_video(
+                    annotated_frames_dir,
+                    save_path,
+                    fps,
+                    original_video_path=original_video_path,
+                    frame_interval=frame_interval,
+                )
                 QMessageBox.information(self, "成功", "视频合成完毕！")
                 print("视频合成完毕。")
                 
@@ -1460,10 +1837,66 @@ class MainWindow(QMainWindow):
         self.stacked_widget.setCurrentIndex(0)
 
     def show_task_view(self):
+        self._autosave_current_annotations()
         self.stacked_widget.setCurrentIndex(1)
         # 返回图片列表时刷新标注状态显示
         if self.current_task_widget:
             self.current_task_widget.load_images()
+
+    def _autosave_current_annotations(self):
+        """离开标注页前自动保存，避免频繁手动点击保存。"""
+        if self.stacked_widget.currentWidget() != self.annotation_widget:
+            return
+        if not hasattr(self.annotation_widget, "annotated_image_path"):
+            return
+        try:
+            saved = self.annotation_widget.save_annotations(only_if_changed=True, refresh_task_list=False)
+            if saved:
+                self.statusBar().showMessage("已自动保存当前标注", 2000)
+            else:
+                self.statusBar().showMessage("标注无变更，已跳过自动保存", 2000)
+            self._update_navigation_buttons()
+        except Exception as e:
+            QMessageBox.warning(self, "自动保存失败", f"自动保存标注失败：{e}")
+
+    def _update_navigation_buttons(self):
+        if not self.current_task_widget:
+            return
+        list_widget = self.current_task_widget.image_list_widget
+        current_row = list_widget.currentRow()
+        total = list_widget.count()
+        has_images = total > 0 and current_row >= 0
+        self.annotation_widget.prev_button.setEnabled(has_images and current_row > 0)
+        self.annotation_widget.next_button.setEnabled(has_images and current_row < total - 1)
+        has_unannotated = any(list_widget.item(i).text().startswith("⚪ ") for i in range(total))
+        self.annotation_widget.next_unannotated_button.setEnabled(has_images and has_unannotated)
+        current_display = current_row + 1 if has_images else 0
+        self.annotation_widget.set_progress_text(f"图片 {current_display}/{total}")
+        self._update_annotation_summary()
+
+    def _update_annotation_summary(self):
+        if not self.current_task_name:
+            self.status_summary_label.setText("待开始")
+            return
+        annotated_count = 0
+        pending_count = 0
+        base_task_dir = os.path.join("data", self.current_task_name)
+        original_frames_dir = os.path.join(base_task_dir, "original_frames")
+        annotated_frames_dir = os.path.join(base_task_dir, "annotated_frames")
+        if os.path.exists(original_frames_dir):
+            images = [f for f in sorted(os.listdir(original_frames_dir)) if f.endswith(".png")]
+            for image_name in images:
+                json_path = os.path.join(annotated_frames_dir, os.path.splitext(image_name)[0] + ".json")
+                if os.path.exists(json_path):
+                    annotated_count += 1
+                else:
+                    pending_count += 1
+        self.status_summary_label.setText(f"已标注 {annotated_count} | 未标注 {pending_count}")
+
+    def closeEvent(self, event):
+        # 关闭窗口前再做一次自动保存，避免最后一次修改丢失
+        self._autosave_current_annotations()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
